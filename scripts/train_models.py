@@ -93,7 +93,7 @@ def run_pipeline(config_path, skip_train=False):
         backtest_df = pd.read_parquet(feature_dir / f"{market}_features_backtest.parquet")
         
         # 3. Identify Features
-        exclude_cols = ['target_mcp_rs_mwh', 'target_date', 'target_hour', 'delivery_start_ist', 'date']
+        exclude_cols = ['target_mcp_rs_mwh', 'target_date', 'target_block', 'delivery_start_ist', 'date']
         feature_cols = [c for c in train_df.columns if c not in exclude_cols]
         
         if not skip_train:
@@ -174,10 +174,10 @@ def run_pipeline(config_path, skip_train=False):
                 print(f"Model Test RMSE: {test_metrics['rmse']:.2f}")
                 
                 # Hour-specific residuals (diagnostic)
-                hour_col = 'target_hour' if 'target_hour' in df_split.columns else 'hour' # Fallback
-                if hour_col in df_split.columns:
+                block_col = 'target_block' if 'target_block' in df_split.columns else 'target_hour'
+                if block_col in df_split.columns:
                     h_res = {}
-                    for h in sorted(df_split[hour_col].unique()):
+                    for h in sorted(df_split[block_col].unique()):
                         mask_h = df_split[hour_col] == h
                         if mask_h.any():
                             h_res[int(h)] = compute_metrics(y_backtest[mask_h], q50_pred[mask_h])
@@ -205,7 +205,7 @@ def run_pipeline(config_path, skip_train=False):
             d1_backtest_df = pd.read_parquet(feature_dir / f"{d1_market}_features_backtest.parquet")
             
             # Same features as DAM
-            exclude_cols = ['target_mcp_rs_mwh', 'target_date', 'target_hour', 'delivery_start_ist', 'date']
+            exclude_cols = ['target_mcp_rs_mwh', 'target_date', 'target_block', 'delivery_start_ist', 'date']
             feature_cols = [c for c in d1_train_df.columns if c not in exclude_cols]
             
             X_d1_train = d1_train_df[feature_cols]
