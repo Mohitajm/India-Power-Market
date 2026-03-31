@@ -21,7 +21,7 @@ splits:
     end: "2025-06-24"
 
 # ─── Resolution ───
-resolution: hourly
+resolution: 15min
 
 # ─── Markets ───
 markets:
@@ -32,7 +32,7 @@ markets:
 forecast_horizons:
   dam:
     type: multi_step       # predict 24 values at once
-    steps: 24              # all hours of next day
+    steps: 96              # all hours of next day
     decision_hour: 9       # features available up to D-1 09:00
     description: "Day-ahead batch: predict 24 hourly MCPs for day D using information available at 09:00 on day D-1"
   rtm:
