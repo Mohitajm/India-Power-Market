@@ -93,7 +93,7 @@ def validate_features(config_path):
         if market == 'dam' and 'backtest' in dfs:
             df = dfs['backtest']
             counts = df.groupby('target_date').size()
-            if not (counts == 24).all():
+            if not (counts == 96).all():
                  errors.append(f"DAM Backtest: Not all dates have 24 rows")
                  
         # 5. DAM Anti-Leakage Spot Check
