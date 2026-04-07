@@ -1,38 +1,59 @@
+# config/costs_config.yaml
+# Cost model for Solar + BESS arbitrage at Jamnagar
+
 costs:
-  # IEX Transaction Fees
+  # IEX Transaction Fees (CERC Regulation 23 cap)
   iex_transaction_fee:
     enabled: true
-    fee_per_mwh_per_side: 200  # ₹/MWh (2 paise/kWh) applied to BOTH charge and discharge
-    # Round-trip cost = 2 × 200 = ₹400/MWh
+    fee_per_mwh_per_side: 200        # Rs/MWh — applied to BOTH charge and discharge
+    # Round-trip IEX cost = 2 x 200 = Rs 400/MWh
 
   # SLDC/RLDC Scheduling Charges
   scheduling_charges:
     enabled: true
-    sldc_per_day: 2000  # ₹/day flat daily cap
-    rldc_per_mwh: 1.80  # ₹/MWh for scheduled energy
+    sldc_per_day: 2000               # Rs/day flat daily cap
+    rldc_per_mwh: 1.80               # Rs/MWh for scheduled energy
 
-  # Battery Degradation (constant ₹/MWh throughput)
+  # Battery Degradation
   degradation:
     enabled: true
-    cost_per_mwh_throughput: 650  # ₹/MWh discharged
+    cost_per_mwh_throughput: 650     # Rs/MWh discharged (all discharge paths)
 
   # ISTS Transmission Charges
   ists_charges:
     enabled: false
     charge_per_mwh: 0
-    waiver: true  # Standalone merchant BESS — ISTS waiver assumed (policy-dependent)
+    waiver: true                     # ISTS waiver for BESS co-located with RE
 
   # DSM Penalties (CERC DSM Regs 2024)
   dsm_penalties:
     enabled: true
-    mode: "block_wise_nr"
-    physical_error_pct: 3.0           # Physical deviation basis (approx 3% of throughput)
-    estimated_as_cost_rs_mwh: 5000.0   # Approximation for ancillary services cost
-    nr_ceiling_rs_mwh: 8000.0         # Regulatory cap for Normal Rate
-    fallback_nr_rs_mwh: 4500.0        # Fallback if prices are missing
+    mode: block_wise_nr
+    physical_error_pct: 3.0          # 3% of physical throughput
+    estimated_as_cost_rs_mwh: 5000.0
+    nr_ceiling_rs_mwh: 8000.0
+    fallback_nr_rs_mwh: 4500.0
+    # DSM charge-failure: applied when physical SoC ceiling is breached
+    # despite the 5% buffer. Penalty = rejected_mwh * dam_actual * 1.25
+    charge_failure_multiplier: 1.25
 
   # Open Access / Cross-Subsidy
   open_access:
     enabled: false
     cross_subsidy_surcharge_per_mwh: 0
     additional_surcharge_per_mwh: 0
+
+  # Captive Consumer PPA
+  # Revenue earned when BESS discharges to captive consumer (c_d_rt)
+  # or when solar delivers directly to captive (s_cd_rt).
+  captive_ppa:
+    enabled: true
+    rate_rs_mwh: 3500.0              # Rs/MWh — must match bess.yaml ppa_rate_rs_mwh
+
+  # Solar Opportunity Cost
+  # Cost applied in LP objective when solar is routed to BESS (s_c_da).
+  # Represents foregone PPA revenue — the LP will only store solar when
+  # expected future IEX discharge revenue > this rate.
+  solar_opportunity_cost:
+    enabled: true
+    rate_rs_mwh: 3500.0              # Rs/MWh — must match ppa_rate_rs_mwh
