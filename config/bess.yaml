@@ -1,9 +1,5 @@
 # config/bess.yaml
-# Solar + BESS Physical Parameters
-# System: 35 MWp Solar PV + 5 MWh BESS at Jamnagar, Gujarat
-
-# BESS physical
-p_max_mw: 2.5
+p_max_mw: 0.5
 e_max_mwh: 4.75
 e_min_mwh: 0.50
 eta_charge: 0.9487
@@ -13,21 +9,8 @@ soc_terminal_min_mwh: 2.50
 degradation_cost_rs_mwh: 650.0
 iex_fee_rs_mwh: 200.0
 max_cycles_per_day: null
-
-# Solar PV (35 MWp at Jamnagar 22.47N 70.07E)
 solar_capacity_mwp: 35.0
-
-# Captive consumer PPA rate
-# Also used as solar opportunity cost in Stage 1 LP objective:
-#   -ppa_rate * s_c_da[t] forces LP to compare store-vs-sell-to-captive
 ppa_rate_rs_mwh: 3500.0
-
-# SoC planning buffer (5% at ceiling and floor)
-# e_max_plan = 4.75 * 0.95 = 4.5125 MWh
-# e_min_plan = 0.50 * 1.05 = 0.5250 MWh
-# Prevents DSM charge-failure when actual solar exceeds DA forecast
 soc_buffer_pct: 0.05
-
-# Terminal SoC mode
-soc_terminal_mode: soft
+soc_terminal_mode: hard
 soc_terminal_value_rs_mwh: 0.0
