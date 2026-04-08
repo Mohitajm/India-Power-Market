@@ -4,12 +4,20 @@
 solver: CBC
 n_scenarios: 100
 lambda_risk: 0.0
-lambda_dev: 2.5
-dev_max_mw: 2.5
+lambda_dev: 0.5
+dev_max_mw: 0.5
 risk_alpha: 0.1
 
 # Stage 2B reschedule blocks (IST approx: 08:30, 10:30, 12:30, 14:30)
 reschedule_blocks: [34, 42, 50, 58]
+
+# discharge_price_threshold_rs_mwh is NOT set here.
+# Stage 2A will discharge purely based on LP revenue maximisation
+# with no artificial price floor. The LP already accounts for:
+#   - remaining SoC needed to meet hard terminal constraint (2.5 MWh)
+#   - degradation cost (Rs 650/MWh)
+#   - IEX fee (Rs 200/MWh per side)
+# So discharge only happens when it genuinely increases net revenue.
 
 paths:
   scenarios_dam:   Data/Predictions/joint_dam_scenarios_backtest_recalibrated.parquet
