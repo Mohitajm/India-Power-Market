@@ -297,17 +297,28 @@ def reschedule_captive(
 def solve_stage2a_block(
     params, block_B, soc_actual_B, dam_schedule, dam_actual,
     p_rtm_lag4, rtm_q50, s_c_rt_B, c_d_rt_B, verbose=False,
-    discharge_price_threshold=DEFAULT_DISCHARGE_THRESHOLD,
+    discharge_price_threshold=0.0,
 ) -> Tuple[float, float]:
     """
-    Stage 2A — FIX 2: price-threshold guard on discharge.
-    Battery will not discharge unless current RTM q50 > threshold.
-    Preserves SoC for high-price evening blocks.
+    Stage 2A — Rolling MPC, one block at a time.
+
+    Terminal constraint: soc[remaining] >= soc_terminal_min_mwh (2.5 MWh).
+    This means the LP plans all remaining blocks such that the battery
+    returns to >= 2.5 MWh by end of day, matching the Stage 1 hard constraint.
+
+    No price threshold. LP discharges whenever net revenue after costs is
+    positive (break-even ~Rs 985/MWh = degradation + IEX fee + DSM proxy).
+
+    Lag-4 conditioning: adjusts q50 forecast using the latest known actual
+    RTM price (1-hour publication lag), with exponential decay over horizon.
     """
     e_min_p, e_max_p = _plan_bounds(params)
+    # Terminal target: must return battery to soc_terminal_min_mwh by EOD.
+    # This is the same hard constraint enforced in Stage 1.
+    soc_terminal_target = params.soc_terminal_min_mwh   # 2.5 MWh
     remaining = T_BLOCKS - block_B
 
-    # Condition q50 by lag-4 actual
+    # Condition q50 forecast by lag-4 actual RTM price
     rtm_lp = rtm_q50[block_B:].copy().astype(float)
     if not np.isnan(p_rtm_lag4) and block_B >= 4:
         q50_at_lag4 = float(rtm_q50[block_B - 4])
@@ -321,6 +332,7 @@ def solve_stage2a_block(
     x_c_B    = max(0.0, -x_net_B)
     x_d_B    = max(0.0,  x_net_B)
 
+    # Headroom: how much RTM charge/discharge is physically possible
     charge_hdroom    = max(0.0, params.p_max_mw - s_c_rt_B - x_c_B)
     discharge_hdroom = max(0.0, params.p_max_mw - c_d_rt_B - x_d_B)
     soc_charge_cap    = max(0.0, (e_max_p - soc_actual_B) / (params.eta_charge * DT))
@@ -328,30 +340,31 @@ def solve_stage2a_block(
     charge_hdroom     = min(charge_hdroom,    soc_charge_cap)
     discharge_hdroom  = min(discharge_hdroom, soc_discharge_cap)
 
-    # FIX 2: Hold discharge unless current price exceeds threshold
+    # Optional price threshold (set to 0.0 = disabled by default)
     current_q50 = float(rtm_lp[0]) if len(rtm_lp) > 0 else 0.0
-    if current_q50 < discharge_price_threshold:
+    if discharge_price_threshold > 0.0 and current_q50 < discharge_price_threshold:
         discharge_hdroom = 0.0
-        if verbose:
-            print(f"  [2A] B{block_B:03d} | RTM q50={current_q50:.0f} < threshold={discharge_price_threshold:.0f} → hold discharge")
 
     if charge_hdroom < 1e-4 and discharge_hdroom < 1e-4:
         if verbose:
             print(f"  [2A] B{block_B:03d} | No headroom → y_c=y_d=0")
         return 0.0, 0.0
 
-    prob = pulp.LpProblem(f"Stage2A_B{block_B}", pulp.LpMaximize)
+    prob   = pulp.LpProblem(f"Stage2A_B{block_B}", pulp.LpMaximize)
     y_c_lp = pulp.LpVariable.dicts("yc", range(remaining), 0, charge_hdroom)
     y_d_lp = pulp.LpVariable.dicts("yd", range(remaining), 0, discharge_hdroom)
     soc    = pulp.LpVariable.dicts("s",  range(remaining + 1), e_min_p, e_max_p)
-    prob += soc[0] == soc_init
-    rev = 0
+    prob  += soc[0] == soc_init
+    rev    = 0
 
     for k in range(remaining):
         t_abs   = block_B + k
         p_rtm_k = float(rtm_lp[k])
         x_net_t = float(dam_schedule[t_abs])
-        xc_t    = max(0.0, -x_net_t); xd_t = max(0.0, x_net_t)
+        xc_t    = max(0.0, -x_net_t)
+        xd_t    = max(0.0,  x_net_t)
+        # Include s_c_rt and c_d_rt only for the current block (k=0).
+        # Future blocks: Stage 2B already planned them; Stage 2A treats them as zero.
         sc_t  = s_c_rt_B if k == 0 else 0.0
         cap_t = c_d_rt_B if k == 0 else 0.0
         prob += soc[k + 1] == (
@@ -364,7 +377,12 @@ def solve_stage2a_block(
         rev -= params.degradation_cost_rs_mwh * y_d_lp[k] * DT
         rev -= 135.0 * (y_c_lp[k] + y_d_lp[k]) * DT
 
-    prob += soc[remaining] >= e_min_p
+    # Terminal constraint: plan such that battery ends >= 2.5 MWh.
+    # Same hard target as Stage 1. Ensures Stage 2A does not over-discharge
+    # without planning a recharge. If the LP cannot meet this constraint
+    # (e.g. SoC already too low to recover), it relaxes to e_min_plan.
+    prob += soc[remaining] >= min(soc_terminal_target, soc_init + 0.01)
+
     prob.setObjective(rev)
     prob.solve(pulp.PULP_CBC_CMD(msg=0))
 
@@ -372,11 +390,41 @@ def solve_stage2a_block(
         y_c_B = max(0.0, pulp.value(y_c_lp[0]) or 0.0)
         y_d_B = max(0.0, pulp.value(y_d_lp[0]) or 0.0)
     else:
-        y_c_B, y_d_B = 0.0, 0.0
+        # Fallback: relax terminal to floor and retry
+        prob2  = pulp.LpProblem(f"Stage2A_B{block_B}_relax", pulp.LpMaximize)
+        y_c_lp2 = pulp.LpVariable.dicts("yc2", range(remaining), 0, charge_hdroom)
+        y_d_lp2 = pulp.LpVariable.dicts("yd2", range(remaining), 0, discharge_hdroom)
+        soc2    = pulp.LpVariable.dicts("s2",  range(remaining + 1), e_min_p, e_max_p)
+        prob2  += soc2[0] == soc_init
+        rev2    = 0
+        for k in range(remaining):
+            t_abs   = block_B + k
+            p_rtm_k = float(rtm_lp[k])
+            x_net_t = float(dam_schedule[t_abs])
+            xc_t = max(0.0, -x_net_t); xd_t = max(0.0, x_net_t)
+            sc_t  = s_c_rt_B if k == 0 else 0.0
+            cap_t = c_d_rt_B if k == 0 else 0.0
+            prob2 += soc2[k + 1] == (
+                soc2[k]
+                + params.eta_charge * (sc_t + xc_t + y_c_lp2[k]) * DT
+                - (1.0 / params.eta_discharge) * (xd_t + cap_t + y_d_lp2[k]) * DT
+            )
+            rev2 += p_rtm_k * y_d_lp2[k] * DT - p_rtm_k * y_c_lp2[k] * DT
+            rev2 -= params.iex_fee_rs_mwh * (y_c_lp2[k] + y_d_lp2[k]) * DT
+            rev2 -= params.degradation_cost_rs_mwh * y_d_lp2[k] * DT
+            rev2 -= 135.0 * (y_c_lp2[k] + y_d_lp2[k]) * DT
+        prob2 += soc2[remaining] >= e_min_p   # relaxed floor
+        prob2.setObjective(rev2)
+        prob2.solve(pulp.PULP_CBC_CMD(msg=0))
+        if pulp.LpStatus[prob2.status] == "Optimal":
+            y_c_B = max(0.0, pulp.value(y_c_lp2[0]) or 0.0)
+            y_d_B = max(0.0, pulp.value(y_d_lp2[0]) or 0.0)
+        else:
+            y_c_B, y_d_B = 0.0, 0.0
 
     if verbose:
         print(f"  [2A] B{block_B:03d} | SoC={soc_actual_B:.3f} q50={current_q50:.0f} "
-              f"| y_c={y_c_B:.3f} y_d={y_d_B:.3f}")
+              f"terminal>={soc_terminal_target:.2f} | y_c={y_c_B:.3f} y_d={y_d_B:.3f}")
     return y_c_B, y_d_B
 
 
