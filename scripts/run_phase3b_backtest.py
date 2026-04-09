@@ -237,6 +237,7 @@ def run_backtest(args):
         daily_output = {
             "date":                    date,
             "status":                  res1["status"],
+            "p_max_mw":                bess_params.p_max_mw,
             "soc_initial_mwh":         soc_start_today,
             "soc_initial_source":      "fallback_2.5MWh" if i == 0 else "actual_yesterday_eod",
             "soc_terminal_actual_mwh": actual_eod_soc,
@@ -261,6 +262,7 @@ def run_backtest(args):
             "s_c_rt":                  eval_res["s_c_rt"].tolist(),
             "s_cd_rt":                 eval_res["s_cd_rt"].tolist(),
             "c_d_rt":                  eval_res["c_d_rt"].tolist(),
+            "z_nc_blend":              eval_res["z_nc_blend"].tolist(),
             "soc_realized":            eval_res["soc_path"].tolist(),
             "actual_dam_prices":       day_data["dam_actual"].tolist(),
             "actual_rtm_prices":       day_data["rtm_actual"].tolist(),
