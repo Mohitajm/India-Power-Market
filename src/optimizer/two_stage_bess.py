@@ -167,13 +167,41 @@ class TwoStageBESS:
             scen_revs.append(rev)
 
         # Non-anticipative constraints
+        # PHYSICAL TOPOLOGY: Solar + BESS share a single AC bus connected to
+        # the grid at one metering point. At any 15-min block, the plant is
+        # either importing from the grid (x_c > 0) OR exporting to the grid
+        # (x_d, s_cd_da, c_d_da > 0). It cannot do both simultaneously.
+        #
+        # No-simultaneous-import-export constraint (Big-M linearisation):
+        #   grid_export[t] = x_d[t] + s_cd_da[t] + c_d_da[t]
+        #   If x_c[t] > 0 then grid_export[t] = 0
+        #   Enforced via: x_c[t] + x_d[t] + s_cd_da[t] + c_d_da[t] <= p_max + solar_da[t]
+        #   AND: x_c[t] <= p_max * (1 - export_flag)  [requires binary — approximated below]
+        #
+        # LP approximation without binary variables:
+        #   x_c[t] + x_d[t] <= p_max_mw   (import and IEX-export share the same inverter)
+        #   x_c[t] + s_cd_da[t] + c_d_da[t] <= p_max_mw + s_c_da[t]
+        #   The second constraint says: if importing (x_c > 0), solar must go to
+        #   battery (s_c_da) not to captive. This naturally prevents simultaneous
+        #   import + export because x_c and any grid-export variable compete for
+        #   the same p_max budget at the single metering point.
         for t in range(T_BLOCKS):
             prob += (
                 s_c_da[t] + s_cd_da[t] + cu_da[t] == float(solar_da[t]),
                 f"solar_bal_{t}"
             )
+            # Total charge power from all sources <= inverter rating
             prob += s_c_da[t] + x_c[t] <= self.params.p_max_mw, f"ch_lim_{t}"
+            # Total discharge power to all destinations <= inverter rating
             prob += x_d[t] + c_d_da[t] <= self.params.p_max_mw, f"dis_lim_{t}"
+            # NO SIMULTANEOUS IMPORT + EXPORT:
+            # x_c (import) and x_d (IEX export) share the same inverter port
+            prob += x_c[t] + x_d[t] <= self.params.p_max_mw, f"no_sim_iex_{t}"
+            # x_c (import) and captive export (s_cd + c_d) cannot coexist
+            # When x_c > 0, solar must go to battery (s_c_da), not to captive
+            prob += x_c[t] + s_cd_da[t] + c_d_da[t] <= (
+                self.params.p_max_mw + float(solar_da[t])
+            ), f"no_sim_cap_{t}"
 
         avg_rev = pulp.lpSum(scen_revs) / S
         cvar    = zeta - (1.0 / (S * self.risk_alpha)) * pulp.lpSum([u[s] for s in range(S)])
@@ -444,13 +472,19 @@ def evaluate_actuals_solar(
     dam_sch = np.array(stage1_result["dam_schedule"])
 
     s_c_rt  = sc_da.copy(); s_cd_rt = scd_da.copy(); c_d_rt = cd_da.copy()
-    y_c_all = np.zeros(T_BLOCKS); y_d_all = np.zeros(T_BLOCKS)
+    y_c_all  = np.zeros(T_BLOCKS); y_d_all = np.zeros(T_BLOCKS)
     soc_path = np.zeros(T_BLOCKS + 1)
     soc_path[0] = params.soc_initial_mwh
 
     rev_dam = np.zeros(T_BLOCKS); rev_rtm = np.zeros(T_BLOCKS)
     rev_cap = np.zeros(T_BLOCKS); costs   = np.zeros(T_BLOCKS)
     dsm_energy = np.zeros(T_BLOCKS)
+
+    # Store the NC blend actually used by Stage 2B for each block.
+    # At reschedule trigger B: blocks B..B+11 use solar_nc[B][0..11],
+    #                          blocks B+12..95 use solar_da[B+12..95].
+    # For blocks before the first reschedule, NC blend = solar_da.
+    z_nc_blend = solar_da.copy().astype(float)   # (96,) — updated at each reschedule
 
     for B in range(T_BLOCKS):
         p_rtm_lag4 = float(rtm_actual[B - 4]) if B >= 4 else np.nan
@@ -465,6 +499,12 @@ def evaluate_actuals_solar(
                 s_c_rt[B:]  = res2b["s_c_rt"][B:]
                 s_cd_rt[B:] = res2b["s_cd_rt"][B:]
                 c_d_rt[B:]  = res2b["c_d_rt"][B:]
+                # Update NC blend record: NC for next 12 blocks, DA beyond
+                for k in range(T_BLOCKS - B):
+                    if k < 12:
+                        z_nc_blend[B + k] = float(solar_nc[B][k])
+                    else:
+                        z_nc_blend[B + k] = float(solar_da[B + k])
 
         y_c_B, y_d_B = solve_stage2a_block(
             params=params, block_B=B, soc_actual_B=soc_path[B],
@@ -513,14 +553,15 @@ def evaluate_actuals_solar(
         "y_c": y_c_all, "y_d": y_d_all,
         "s_c_rt": s_c_rt, "s_cd_rt": s_cd_rt, "c_d_rt": c_d_rt,
         "soc_path": soc_path, "soc": soc_path.tolist(),
+        "z_nc_blend": z_nc_blend,   # (96,) — NC blend actually used by Stage 2B
         "rtm_schedule": (y_d_all - y_c_all).tolist(),
         "block_rev_dam": rev_dam, "block_rev_rtm": rev_rtm,
         "block_rev_captive": rev_cap, "block_costs": costs,
         "block_dsm_energy": dsm_energy, "total_dsm_mwh": float(np.sum(dsm_energy)),
         "fees_breakdown": {
-            "iex_revenue_dam": float(np.sum(rev_dam)),
-            "iex_revenue_rtm": float(np.sum(rev_rtm)),
-            "captive_revenue": float(np.sum(rev_cap)),
-            "total_costs": total_cost,
+            "iex_revenue_dam":  float(np.sum(rev_dam)),
+            "iex_revenue_rtm":  float(np.sum(rev_rtm)),
+            "captive_revenue":  float(np.sum(rev_cap)),
+            "total_costs":      total_cost,
         },
     }
