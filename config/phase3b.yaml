@@ -5,7 +5,7 @@ solver: CBC
 n_scenarios: 100
 lambda_risk: 0.0
 lambda_dev: 0.5
-dev_max_mw: 0.5
+dev_max_mw: 1.0
 risk_alpha: 0.1
 
 # Stage 2B reschedule blocks (IST approx: 08:30, 10:30, 12:30, 14:30)
