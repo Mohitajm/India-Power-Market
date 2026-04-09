@@ -91,6 +91,12 @@ def build_full_csv(records: list, ppa_rate: float = 3500.0) -> pd.DataFrame:
         exp_rev   = rec.get("expected_revenue", 0.0)
         soc_init  = rec.get("soc_initial",  2.5)
 
+        # NC blend — saved from evaluate_actuals_solar RAM
+        # Falls back to solar_da if not present (old JSON files)
+        solar_da_list = rec.get("solar_da", [0.0] * T_BLOCKS)
+        z_nc_blend = rec.get("z_nc_blend", solar_da_list)
+        bess_p_max = rec.get("p_max_mw", 0.5)
+
         # Stage 1 SoC plan from scenarios
         scenarios = rec.get("scenarios", [])
         soc_matrix = []
@@ -144,6 +150,9 @@ def build_full_csv(records: list, ppa_rate: float = 3500.0) -> pd.DataFrame:
             scdrt_t = float(s_cd_rt[t])
             cdrt_t  = float(c_d_rt[t])
 
+            # NC blend — actual values used by Stage 2B (saved from RAM)
+            z_nc_t  = float(z_nc_blend[t]) if len(z_nc_blend) > t else sol_t
+
             # Stage 2A
             yc_t  = float(y_c[t])
             yd_t  = float(y_d[t])
@@ -154,10 +163,11 @@ def build_full_csv(records: list, ppa_rate: float = 3500.0) -> pd.DataFrame:
             pq50_t= float(rtm_q50[t])
 
             # SoC
-            soc_plan_t = float(soc_matrix[0][t+1]) if soc_matrix else 0.0
-            soc_mean_t = float(np.mean([m[t+1] for m in soc_matrix])) if soc_matrix else 0.0
-            soc_act_t  = float(soc_actual[t+1]) if len(soc_actual) > t+1 else 0.0
-            soc_gap_t  = soc_plan_t - soc_act_t   # positive = plan exceeded actual
+            # soc_da(t) — Stage 1 LP planned SoC at END of block t (mean across 100 scenarios)
+            soc_da_t   = float(np.mean([m[t+1] for m in soc_matrix])) if soc_matrix else 0.0
+            # soc_rt(t) — Stage 2A actual physical SoC at END of block t
+            soc_rt_t   = float(soc_actual[t+1]) if len(soc_actual) > t+1 else 0.0
+            soc_gap_t  = soc_da_t - soc_rt_t   # positive = LP plan was higher than actual
 
             # Lag-4 conditioning signal
             lag4_t = float(rtm_act[t-4]) if t >= 4 else None
@@ -180,6 +190,10 @@ def build_full_csv(records: list, ppa_rate: float = 3500.0) -> pd.DataFrame:
             # Stage 2B trigger covering this block
             trigger = max([b for b in sorted(RESCHEDULE_BLOCKS) if b <= t], default=None)
 
+            # NC solar balance check: s_c_rt + s_cd_rt + curtail_rt should equal z_nc
+            curtail_rt_t  = max(0.0, z_nc_t - scrt_t - scdrt_t)   # implied curtailment
+            nc_balance_ok = round(abs(scrt_t + scdrt_t + curtail_rt_t - z_nc_t), 5)
+
             rows.append({
                 # ── Identifiers ──────────────────────────────────────────
                 "date":                       date,
@@ -190,13 +204,14 @@ def build_full_csv(records: list, ppa_rate: float = 3500.0) -> pd.DataFrame:
 
                 # ── Stage 1 Inputs ────────────────────────────────────────
                 "z_sol_da_mw":                round(sol_t, 4),
-                "z_sol_at_mw":                round(srat_t, 4),     # actual metered
-                "p_max_mw":                   2.5,
+                "z_sol_nc_mw":                round(z_nc_t, 4),   # NC blend used by Stage 2B
+                "z_sol_at_mw":                round(srat_t, 4),   # actual metered solar
+                "p_max_mw":                   bess_p_max,
                 "e_max_mwh":                  4.75,
                 "e_min_mwh":                  0.50,
                 "e_max_plan_mwh":             4.5125,
                 "e_min_plan_mwh":             0.525,
-                "soc_initial_mwh":            round(soc_init, 4),
+                # soc_initial_mwh REMOVED per Q2 requirement
                 "r_ppa_rs_mwh":               ppa_rate,
                 "actual_dam_price_rs_mwh":    round(pd_t, 2),
                 "actual_rtm_price_rs_mwh":    round(pr_t, 2),
@@ -212,19 +227,23 @@ def build_full_csv(records: list, ppa_rate: float = 3500.0) -> pd.DataFrame:
                 "c_d_da_mw":                  round(cdd_t, 4),  # BESS→captive
                 "curtail_da_mw":              round(cut_t, 4),
                 "captive_da_mw":              round(scd_t + cdd_t, 4),
-                "solar_balance_ok":           round(abs(sc_t + scd_t + cut_t - sol_t), 5),
-                "soc_da_mean_mwh":            round(soc_mean_t, 4),
+                "solar_da_balance_ok":        round(abs(sc_t + scd_t + cut_t - sol_t), 5),
+                # soc_da(t): Stage 1 LP planned SoC at END of block t (mean of 100 scenarios)
+                "soc_da_t_mwh":               round(soc_da_t, 4),
                 "stage1_expected_revenue_rs": round(exp_rev, 0),
 
                 # ── Stage 2B Outputs (revised solar routing) ──────────────
                 "s_c_rt_mw":                  round(scrt_t, 4),
                 "s_cd_rt_mw":                 round(scdrt_t, 4),
                 "c_d_rt_mw":                  round(cdrt_t, 4),
+                "curtail_rt_mw":              round(curtail_rt_t, 4),
                 "captive_rt_mw":              round(scdrt_t + cdrt_t, 4),
-                "z_sol_nc_blend_mw":          round(sol_t, 4),  # DA blend in CSV (NC in RAM only)
+                # NC balance: s_c_rt + s_cd_rt + curtail_rt = z_nc (should be ~0)
+                "nc_solar_balance_ok":        nc_balance_ok,
 
                 # ── Stage 2A Inputs (what LP received) ────────────────────
-                "soc_actual_start_mwh":       round(float(soc_actual[t]) if len(soc_actual) > t else 0.0, 4),
+                # soc_rt(t): actual physical SoC at START of block t (fed into Stage 2A)
+                "soc_rt_start_t_mwh":         round(float(soc_actual[t]) if len(soc_actual) > t else 0.0, 4),
                 # x_c and x_d locked (from Stage 1) — constants in Stage 2A LP
                 "x_c_locked_mw":              round(xc_t, 4),
                 "x_d_locked_mw":              round(xd_t, 4),
@@ -235,8 +254,9 @@ def build_full_csv(records: list, ppa_rate: float = 3500.0) -> pd.DataFrame:
                 "y_c_mw":                     round(yc_t, 4),  # RTM charge
                 "y_d_mw":                     round(yd_t, 4),  # RTM discharge
                 "y_net_mw":                   round(yd_t - yc_t, 4),
-                "soc_actual_end_mwh":         round(soc_act_t, 4),
-                "soc_plan_vs_actual_gap_mwh": round(soc_gap_t, 4),  # >0 = plan higher than actual
+                # soc_rt(t) at END of block t (after Stage 2A dispatch)
+                "soc_rt_end_t_mwh":           round(soc_rt_t, 4),
+                "soc_da_vs_rt_gap_mwh":       round(soc_gap_t, 4),  # >0 = plan above actual
 
                 # ── Settlement Revenue (3-stream + captive) ───────────────
                 "iex_charge_cost_rs":         round(iex_charge, 2),       # negative
