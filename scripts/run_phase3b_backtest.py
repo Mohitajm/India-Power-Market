@@ -70,6 +70,7 @@ def run_backtest(args):
         solar_da_path    = config["paths"]["solar_da_path"],
         solar_nc_path    = config["paths"]["solar_nc_path"],
         solar_at_path    = config["paths"]["solar_at_path"],
+        price_parquet_path = config["paths"].get("price_parquet"),
     )
 
     optimizer = TwoStageBESS(bess_params, config)
