@@ -5,7 +5,21 @@ Scenario Loader — 96-block (15-min) version with Solar support.
 
 Changes from original:
   get_day_solar() method added — loads DA, NC, and actual solar for one date.
-  All existing get_day_scenarios() / get_multiday_scenarios() behaviour unchanged.
+
+FIX 6 — True 15-min actual prices (NEW):
+  Bug: The actuals CSVs (dam_quantiles_backtest.csv, rtm_quantiles_backtest.csv)
+  contain `target_mcp_rs_mwh` which is the volume-weighted hourly average MCP
+  repeated 4× to fill 96 blocks. These are NOT the true 15-min block-level
+  IEX MCPs. Using them for settlement means the backtest settles against
+  smoothed prices, missing intra-hour volatility (MAE up to Rs 386/MWh on
+  RTM for some days).
+
+  Fix: Added optional `price_parquet_path` parameter pointing to the
+  authoritative IEX price parquet (iex_prices_combined_filled.parquet).
+  When provided, `get_day_scenarios()` loads actual DAM and RTM MCPs from
+  this parquet at true 15-min resolution (time_block 1-96, mcp_rs_mwh column).
+  The CSV actuals are only used as a fallback if the parquet path is not
+  provided or the date is missing from the parquet.
 """
 
 import pandas as pd
@@ -34,7 +48,8 @@ class ScenarioLoader:
                  actuals_rtm_path:  str,
                  solar_da_path:     Optional[str] = None,
                  solar_nc_path:     Optional[str] = None,
-                 solar_at_path:     Optional[str] = None):
+                 solar_at_path:     Optional[str] = None,
+                 price_parquet_path: Optional[str] = None):    # FIX 6: NEW
         self.dam_path         = Path(dam_path)
         self.rtm_path         = Path(rtm_path)
         self.actuals_dam_path = Path(actuals_dam_path)
@@ -45,6 +60,10 @@ class ScenarioLoader:
         self.solar_nc_path = Path(solar_nc_path) if solar_nc_path else None
         self.solar_at_path = Path(solar_at_path) if solar_at_path else None
 
+        # FIX 6: IEX price parquet for true 15-min actuals
+        self.price_parquet_path = Path(price_parquet_path) if price_parquet_path else None
+        self._price_parquet_df: Optional[pd.DataFrame] = None
+
         print(f"Loading scenarios from {self.dam_path}...")
         self.dam_df = pd.read_parquet(self.dam_path)
         print(f"Loading scenarios from {self.rtm_path}...")
@@ -53,6 +72,22 @@ class ScenarioLoader:
         self.actuals_dam_df = pd.read_csv(self.actuals_dam_path)
         print(f"Loading RTM actuals from {self.actuals_rtm_path}...")
         self.actuals_rtm_df = pd.read_csv(self.actuals_rtm_path)
+
+        # FIX 6: Load and index IEX price parquet if provided
+        if self.price_parquet_path is not None:
+            if self.price_parquet_path.exists():
+                print(f"Loading IEX price parquet from {self.price_parquet_path} "
+                      f"(true 15-min actuals)...")
+                self._price_parquet_df = pd.read_parquet(self.price_parquet_path)
+                self._price_parquet_df['date'] = self._price_parquet_df['date'].astype(str)
+                print(f"  IEX parquet: {len(self._price_parquet_df)} rows, "
+                      f"markets={list(self._price_parquet_df['market'].unique())}")
+            else:
+                warnings.warn(
+                    f"price_parquet_path '{self.price_parquet_path}' not found. "
+                    f"Falling back to CSV actuals (volume-weighted hourly averages).",
+                    RuntimeWarning,
+                )
 
         # Lazy-loaded solar DataFrames
         self._solar_da_df: Optional[pd.DataFrame] = None
@@ -79,7 +114,46 @@ class ScenarioLoader:
               f"to {self.common_dates[-1] if self.common_dates else 'none'})")
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Existing methods (unchanged)
+    # FIX 6: Load true 15-min actuals from IEX price parquet
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _get_actuals_from_parquet(self, target_date: str, market: str
+                                  ) -> Optional[np.ndarray]:
+        """
+        Extract true 15-min block-level MCP from the IEX price parquet.
+
+        Parameters
+        ----------
+        target_date : str  'YYYY-MM-DD'
+        market      : str  'dam' or 'rtm'
+
+        Returns
+        -------
+        np.ndarray (96,) Rs/MWh if available, or None if date/market not found.
+        """
+        if self._price_parquet_df is None:
+            return None
+
+        mask = (
+            (self._price_parquet_df['date'] == target_date) &
+            (self._price_parquet_df['market'] == market)
+        )
+        day_data = self._price_parquet_df[mask].sort_values('time_block')
+
+        if len(day_data) != BLOCKS_PER_DAY:
+            # Date might be missing or have partial data
+            if len(day_data) > 0:
+                warnings.warn(
+                    f"IEX parquet has {len(day_data)} rows for {target_date}/{market} "
+                    f"(expected {BLOCKS_PER_DAY}). Falling back to CSV actuals.",
+                    RuntimeWarning,
+                )
+            return None
+
+        return day_data['mcp_rs_mwh'].values.astype(np.float64)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Existing helper methods
     # ──────────────────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -100,9 +174,18 @@ class ScenarioLoader:
     def _expand_hourly_scenarios_to_blocks(matrix: np.ndarray) -> np.ndarray:
         return np.repeat(matrix, 4, axis=1)
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # Main data loading methods
+    # ──────────────────────────────────────────────────────────────────────────
+
     def get_day_scenarios(self, target_date: str, n_scenarios: int = 100) -> Dict:
         """
         Return DAM/RTM scenarios and actuals for one day — always 96-block.
+
+        FIX 6: Actuals are loaded from the IEX price parquet (true 15-min MCPs)
+        when price_parquet_path was provided. Falls back to the CSV actuals
+        (volume-weighted hourly averages) if the parquet is not available or
+        the date is missing.
 
         Returns
         -------
@@ -128,19 +211,36 @@ class ScenarioLoader:
             dam_scen = self._expand_hourly_scenarios_to_blocks(dam_raw)
             rtm_scen = self._expand_hourly_scenarios_to_blocks(rtm_raw)
 
-        sort_col = ("target_block"
-                    if "target_block" in self.actuals_dam_df.columns
-                    else "target_hour")
-        a_dam = (self.actuals_dam_df[self.actuals_dam_df["target_date"] == target_date]
-                 .sort_values(sort_col))
-        a_rtm = (self.actuals_rtm_df[self.actuals_rtm_df["target_date"] == target_date]
-                 .sort_values(sort_col))
+        # ── FIX 6: Try IEX parquet first for true 15-min actuals ─────────────
+        dam_actual = self._get_actuals_from_parquet(target_date, 'dam')
+        rtm_actual = self._get_actuals_from_parquet(target_date, 'rtm')
 
-        act_col_d = "actual_mcp" if "actual_mcp" in a_dam.columns else "target_mcp_rs_mwh"
-        act_col_r = "actual_mcp" if "actual_mcp" in a_rtm.columns else "target_mcp_rs_mwh"
+        # ── Fallback to CSV actuals if parquet not available ──────────────────
+        if dam_actual is None:
+            sort_col = ("target_block"
+                        if "target_block" in self.actuals_dam_df.columns
+                        else "target_hour")
+            a_dam = (self.actuals_dam_df[
+                         self.actuals_dam_df["target_date"] == target_date
+                     ].sort_values(sort_col))
+            act_col_d = ("actual_mcp" if "actual_mcp" in a_dam.columns
+                         else "target_mcp_rs_mwh")
+            dam_actual = self._expand_hourly_actuals_to_blocks(
+                a_dam[act_col_d].values
+            )
 
-        dam_actual = self._expand_hourly_actuals_to_blocks(a_dam[act_col_d].values)
-        rtm_actual = self._expand_hourly_actuals_to_blocks(a_rtm[act_col_r].values)
+        if rtm_actual is None:
+            sort_col = ("target_block"
+                        if "target_block" in self.actuals_rtm_df.columns
+                        else "target_hour")
+            a_rtm = (self.actuals_rtm_df[
+                         self.actuals_rtm_df["target_date"] == target_date
+                     ].sort_values(sort_col))
+            act_col_r = ("actual_mcp" if "actual_mcp" in a_rtm.columns
+                         else "target_mcp_rs_mwh")
+            rtm_actual = self._expand_hourly_actuals_to_blocks(
+                a_rtm[act_col_r].values
+            )
 
         return {
             "dam":        dam_scen,
@@ -209,7 +309,7 @@ class ScenarioLoader:
         }
 
     # ──────────────────────────────────────────────────────────────────────────
-    # NEW: Solar data loading
+    # Solar data loading
     # ──────────────────────────────────────────────────────────────────────────
 
     def get_day_solar(self, target_date: str) -> Dict[str, np.ndarray]:
@@ -289,7 +389,6 @@ class ScenarioLoader:
         if len(nc_day) == 0:
             warnings.warn(f"No solar NC data for {target_date}. Using DA for all windows.",
                           RuntimeWarning)
-            # Fallback: NC = DA (no nowcast improvement)
             solar_nc = np.zeros((BLOCKS_PER_DAY, NC_WINDOW), dtype=np.float32)
             for k in range(NC_WINDOW):
                 for b in range(BLOCKS_PER_DAY):
