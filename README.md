@@ -34,25 +34,15 @@ pip install -r requirements.txt
 # macOS:  brew install cbc
 # Ubuntu: sudo apt-get install coinor-cbc
 
-# 3. End-to-end pipeline (single-day backtest)
 python scripts/build_features.py              # Feature engineering
 python scripts/train_models.py                # Train DAM/RTM/D+1 quantile models
 python scripts/run_recalibration.py           # CQR conformal recalibration
 python scripts/fit_joint_copula.py            # Estimate cross-market correlations
 python scripts/build_joint_scenarios_recal.py # Generate 200 recalibrated scenarios/day
+python scripts/build_solar_profiles.py        # Generate solar DA/NC/actuals parquets
 python scripts/run_phase3b_backtest.py        # Run single-day two-stage SP backtest
 
-# 4. Multi-day strategies
-python scripts/build_multiday_scenarios.py                          # 7-day correlated scenarios
-python scripts/run_rolling_horizon_backtest.py --config config/phase4_rolling_optb.yaml
-python scripts/run_multiday_backtest.py --config config/phase4_multiday_optb.yaml
-
-# 5. Analysis
-python scripts/run_cvar_sweep.py              # CVaR efficient frontier
-python scripts/compare_multiday_strategies.py # Six-strategy comparison
-python scripts/visualize_results.py           # Generate all charts
-```
-
+python scripts/export_backtest_csvs.py        # Export full block-level CSV
 ---
 
 ## Data Requirements
