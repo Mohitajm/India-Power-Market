@@ -24,6 +24,11 @@ paths:
   scenarios_rtm:   Data/Predictions/joint_rtm_scenarios_backtest_recalibrated.parquet
   actuals_dam:     Data/Predictions/dam_quantiles_backtest.csv
   actuals_rtm:     Data/Predictions/rtm_quantiles_backtest.csv
+  # FIX 6: True 15-min IEX price parquet for settlement actuals.
+  # When provided, ScenarioLoader uses mcp_rs_mwh from this parquet
+  # (time_block 1-96) instead of the CSV target_mcp_rs_mwh which contains
+  # volume-weighted hourly averages repeated 4x.
+  price_parquet:   Data/Cleaned/price/iex_prices_combined_filled.parquet
   solar_da_path:   Data/Solar/solar_da.parquet
   solar_nc_path:   Data/Solar/solar_nc.parquet
   solar_at_path:   Data/Solar/solar_actuals.parquet
