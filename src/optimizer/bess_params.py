@@ -61,6 +61,6 @@ class BESSParams:
 
     @classmethod
     def from_yaml(cls, path: str) -> "BESSParams":
-        with open(path, "r", encoding="ascii") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
         return cls(**data)
