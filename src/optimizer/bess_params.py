@@ -1,17 +1,13 @@
 """
 src/optimizer/bess_params.py
 =============================
-Battery + Solar parameter dataclass for the Solar + BESS optimizer.
+Battery + Solar parameter dataclass — Architecture v3.
 
-New fields vs. BESS-only version:
-  solar_capacity_mwp   : float  Solar PV nameplate capacity (MWp)
-  ppa_rate_rs_mwh      : float  Captive consumer PPA rate (Rs/MWh)
-                                 Also used as solar opportunity cost in LP objective.
-  soc_buffer_pct       : float  SoC planning buffer (fraction, default 5%).
-                                 Planning ceiling = e_max_mwh * (1 - buffer)
-                                 Planning floor   = e_min_mwh * (1 + buffer)
-                                 Leaves headroom for solar forecast errors,
-                                 preventing DSM charge-failure penalties.
+Changes vs previous version:
+  solar_inverter_mw    : float  Solar inverter AC rating (MW). Default 25.0.
+  rtm_lead_blocks      : int    RTM bid lead time (blocks). Default 3.
+  captive_buffer_blocks: int    Captive schedule ramp buffer (blocks). Default 12.
+  captive_buffer_tolerance_mw: float  Tolerance on captive buffer (MW). Default 0.5.
 """
 
 from dataclasses import dataclass
@@ -21,56 +17,50 @@ import yaml
 
 @dataclass
 class BESSParams:
-    # ── BESS physical ─────────────────────────────────────────────────────────
-    p_max_mw:              float          # Max charge / discharge power (MW)
-    e_max_mwh:             float          # SoC physical ceiling (MWh)
-    e_min_mwh:             float          # SoC physical floor (MWh)
-    eta_charge:            float          # One-way charge efficiency (fraction)
-    eta_discharge:         float          # One-way discharge efficiency (fraction)
-    soc_initial_mwh:       float          # Starting SoC — chained overnight (MWh)
-    soc_terminal_min_mwh:  float          # Hard terminal SoC minimum (MWh)
-    degradation_cost_rs_mwh: float        # Throughput degradation cost (Rs/MWh discharged)
-    iex_fee_rs_mwh:        float          # IEX transaction fee per side (Rs/MWh)
+    # -- BESS physical --
+    p_max_mw:              float
+    e_max_mwh:             float
+    e_min_mwh:             float
+    eta_charge:            float
+    eta_discharge:         float
+    soc_initial_mwh:       float
+    soc_terminal_min_mwh:  float
+    degradation_cost_rs_mwh: float
+    iex_fee_rs_mwh:        float
 
-    # ── Solar PV ──────────────────────────────────────────────────────────────
-    solar_capacity_mwp:    float = 35.0   # Solar PV nameplate (MWp). Jamnagar plant.
+    # -- Solar PV --
+    solar_capacity_mwp:    float = 35.0
+    solar_inverter_mw:     float = 25.0    # NEW: inverter AC rating
 
-    # ── Captive consumer ──────────────────────────────────────────────────────
-    ppa_rate_rs_mwh:       float = 3500.0 # PPA rate = captive revenue = solar opp cost (Rs/MWh)
+    # -- Captive consumer --
+    ppa_rate_rs_mwh:       float = 3500.0
 
-    # ── SoC buffer ────────────────────────────────────────────────────────────
-    soc_buffer_pct:        float = 0.05   # 5% buffer at both ceiling and floor
-                                          # Planning ceiling = e_max_mwh * (1 - 0.05)
-                                          # Planning floor   = e_min_mwh * (1 + 0.05)
+    # -- SoC buffer --
+    soc_buffer_pct:        float = 0.05
 
-    # ── Cycle limit ───────────────────────────────────────────────────────────
-    max_cycles_per_day:    Optional[float] = None  # None = unconstrained (merchant mode)
+    # -- Cycle limit --
+    max_cycles_per_day:    Optional[float] = None
 
-    # ── Terminal SoC mode ─────────────────────────────────────────────────────
-    soc_terminal_mode:     str   = "soft"  # "hard" | "soft" | "physical"
-    soc_terminal_value_rs_mwh: float = 0.0  # Rs/MWh continuation value (soft terminal)
+    # -- Terminal SoC mode --
+    soc_terminal_mode:     str   = "hard"
+    soc_terminal_value_rs_mwh: float = 0.0
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Derived properties (computed, not stored in YAML)
-    # ──────────────────────────────────────────────────────────────────────────
+    # -- RTM timing --
+    rtm_lead_blocks:       int   = 3       # NEW: bid B+3 at block B
+    captive_buffer_blocks: int   = 12      # NEW: 12-block captive ramp buffer
+    captive_buffer_tolerance_mw: float = 0.5  # NEW: +/- MW tolerance
 
+    # -- Derived --
     @property
     def e_max_plan_mwh(self) -> float:
-        """SoC planning ceiling with 5% buffer. LP never exceeds this."""
         return self.e_max_mwh * (1.0 - self.soc_buffer_pct)
 
     @property
     def e_min_plan_mwh(self) -> float:
-        """SoC planning floor with 5% buffer. LP never goes below this."""
         return self.e_min_mwh * (1.0 + self.soc_buffer_pct)
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # YAML loader
-    # ──────────────────────────────────────────────────────────────────────────
 
     @classmethod
     def from_yaml(cls, path: str) -> "BESSParams":
-        """Load parameters from a YAML file. File must be ASCII-encoded."""
         with open(path, "r", encoding="ascii") as f:
             data = yaml.safe_load(f)
         return cls(**data)
