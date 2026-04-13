@@ -1,17 +1,16 @@
 # config/bess.yaml
 # Solar + BESS Physical Parameters
-# System: 35 MWp Solar PV + 5 MWh BESS at Jamnagar, Gujarat
+# System: 35 MWp Solar PV (25 MW inverter) + 5 MWh BESS (2.5 MW PCS)
+# Location: Jamnagar, Gujarat
 
 # BESS physical
-p_max_mw: 1.0
+p_max_mw: 2.5
 e_max_mwh: 4.75
 e_min_mwh: 0.50
 eta_charge: 0.9487
 eta_discharge: 0.9487
 
-# SOC_start = SOC_end = 2.5 MWh every day
-# Hard terminal forces the LP to return to 2.5 MWh by end of day.
-# SoC chaining in run_phase3b_backtest.py is DISABLED (reset to 2.5 each day).
+# SOC_start = SOC_end = 2.5 MWh every day (hard equality)
 soc_initial_mwh: 2.50
 soc_terminal_min_mwh: 2.50
 
@@ -22,17 +21,23 @@ max_cycles_per_day: null
 # Solar PV (35 MWp at Jamnagar 22.47N 70.07E)
 solar_capacity_mwp: 35.0
 
+# Solar inverter AC rating (MW) — NEW
+# Inverter and PCS outputs connect in parallel to one AC bus.
+solar_inverter_mw: 25.0
+
 # Captive consumer PPA rate
 ppa_rate_rs_mwh: 3500.0
 
 # SoC planning buffer (5% at ceiling and floor)
-# Purpose: absorb solar forecast error so actual solar overshoot
-# does not breach the physical ceiling and trigger DSM penalty.
-# e_max_plan = 4.75 * 0.95 = 4.5125 MWh  (planning ceiling)
-# e_min_plan = 0.50 * 1.05 = 0.5250 MWh  (planning floor)
 soc_buffer_pct: 0.05
 
-# Hard terminal: LP must return SoC >= 2.5 MWh at end of every day.
-# This gives the same start and end SoC each day.
+# Hard terminal: SoC == 2.5 MWh at end of every day (equality constraint)
 soc_terminal_mode: hard
 soc_terminal_value_rs_mwh: 0.0
+
+# RTM bid lead time (blocks) — at block B, commit y_c/y_d for block B+3
+rtm_lead_blocks: 3
+
+# Captive schedule ramp buffer (blocks) — 12 blocks = 3 hours notice
+captive_buffer_blocks: 12
+captive_buffer_tolerance_mw: 0.5
