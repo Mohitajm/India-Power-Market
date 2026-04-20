@@ -1,427 +1,288 @@
 """
-scripts/export_backtest_csvs.py
-=================================
-Architecture v3 CSV export — Final version.
-
-Changes vs prior version:
-  1. stage1_expected_revenue_rs is now PER-BLOCK (scenario-averaged),
-     not the full-day total repeated. Formula documented below.
-  2. Added soc_da_start_mwh (Stage 1 planned SoC at START of block t).
-  3. Added c_d_plan_vs_actual_mw.
-  4. Added soc_actual_start_mwh and soc_actual_end_mwh (clearer naming).
-  5. All revenue formulas documented in column comments.
-  6. daily_cycles_bess replaced with cumulative_bess_cycles (running total).
-  7. All daily_* aggregates replaced with cumulative block-level running totals.
-
-Revenue formulas (per block t, DT = 0.25 hours):
-  iex_charge_cost_rs      = actual_dam_price[t] × (-x_c[t]) × DT
-                            (negative — cost of buying from IEX DAM)
-  iex_dam_discharge_rs    = actual_dam_price[t] × x_d[t] × DT
-                            (positive — revenue from selling to IEX DAM)
-  iex_rtm_charge_cost_rs  = actual_rtm_price[t] × (-y_c[t]) × DT
-                            (negative — cost of buying from IEX RTM)
-  iex_rtm_discharge_rs    = actual_rtm_price[t] × y_d[t] × DT
-                            (positive — revenue from selling to IEX RTM)
-  iex_net_block_rs        = sum of the above 4 IEX streams
-  captive_revenue_rs      = r_ppa × captive_actual[t] × DT
-                            where captive_actual = s_cd_actual + c_d_actual
-                            (positive — PPA revenue for energy delivered)
-  total_block_revenue_rs  = iex_net_block_rs + captive_revenue_rs
-
-Stage 1 expected block revenue (scenario-weighted, from LP plan):
-  stage1_exp_block_rev[t] = (1/S) × sum_s [
-      dam_scenario[s,t] × x_d[t] × DT
-    - dam_scenario[s,t] × x_c[t] × DT
-    + r_ppa × (s_cd_da[t] + c_d_da[t]) × DT
-    - iex_fee × (x_c[t] + x_d[t]) × DT
-    - deg_cost × (x_d[t] + c_d_da[t]) × DT
-    - 135 × (x_c[t] + x_d[t]) × DT
-  ]
-  Since we don't have per-scenario DAM prices in the export JSON, we use
-  the mean scenario price (approximated from the saved scenario SoC traces
-  and LP expected revenue). For a simpler and accurate approach, we compute
-  a "reconstructed" per-block expected revenue using the actual DAM price
-  as a proxy for the scenario-average price at that block:
-    stage1_exp_block_rev_rs = p_dam_actual[t] × (x_d[t] - x_c[t]) × DT
-                            + r_ppa × (s_cd_da[t] + c_d_da[t]) × DT
-                            - iex_fee × (x_c[t] + x_d[t]) × DT
-                            - deg_cost × (x_d[t] + c_d_da[t]) × DT
-                            - 135 × (x_c[t] + x_d[t]) × DT
-
-Run:
-    python scripts/export_backtest_csvs.py
-    python scripts/export_backtest_csvs.py --results results/phase3b_solar
+scripts/export_backtest_csvs.py — Architecture v9_revised
+Exports ~90 columns per (date, block) including DSM settlement,
+BESS ROI counterfactual, and cumulative tracking.
 """
-
-import argparse
-import json
-import sys
+import argparse, json, sys
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-T_BLOCKS          = 96
-DT                = 0.25
+T_BLOCKS = 96
+DT = 0.25
 RESCHEDULE_BLOCKS = {34, 42, 50, 58}
-USABLE_CAPACITY   = 4.25    # e_max_mwh - e_min_mwh = 4.75 - 0.50
+USABLE_CAP = 4.25  # e_max - e_min
 
 
-def block_time(b: int) -> str:
-    h = (b * 15) // 60
-    m = (b * 15) % 60
-    return f"{h:02d}:{m:02d}"
+def block_time(b):
+    return f"{(b*15)//60:02d}:{(b*15)%60:02d}"
 
 
-def load_jsons(results_dir: Path) -> list:
-    daily_dir = results_dir / "daily"
-    if not daily_dir.exists():
-        raise FileNotFoundError(f"No daily results at {daily_dir}")
-    files = sorted(daily_dir.glob("result_*.json"))
+def sg(arr, i, d=0.0):
+    if arr is None or i >= len(arr):
+        return d
+    v = arr[i]
+    return float(v) if v is not None else d
+
+
+def load_jsons(rdir):
+    dd = Path(rdir) / "daily"
+    files = sorted(dd.glob("result_*.json"))
     if not files:
-        raise FileNotFoundError(f"No result JSON files in {daily_dir}")
+        raise FileNotFoundError(f"No results in {dd}")
     print(f"Loading {len(files)} daily result files...")
-    records = []
-    for fp in files:
-        with open(fp) as f:
-            records.append(json.load(f))
-    return records
+    return [json.load(open(f)) for f in files]
 
 
-def safe_get(arr, idx, default=0.0):
-    if arr is None or idx >= len(arr):
-        return default
-    v = arr[idx]
-    return float(v) if v is not None else default
+def build_csv(records, ppa, iex_fee, deg_cost):
+    avail_cap = 25.0 * DT  # S_inv * DT = 6.25
 
-
-def build_full_csv(records: list, ppa_rate: float = 3500.0,
-                   iex_fee: float = 200.0, deg_cost: float = 650.0,
-                   dsm_proxy: float = 135.0) -> pd.DataFrame:
-    """Build one row per (date, block) with all fields."""
     rows = []
-
     for rec in records:
         date = rec.get("date", "")
+        p_max = rec.get("p_max_mw", 2.5)
+        s_inv = rec.get("solar_inverter_mw", 25.0)
 
-        # Parameters
-        bess_p_max = rec.get("p_max_mw", 2.5)
-        sol_inv_mw = rec.get("solar_inverter_mw", 25.0)
+        # Stage 1
+        x_c = rec.get("x_c", [0]*96)
+        x_d = rec.get("x_d", [0]*96)
+        sc_da = rec.get("s_c_da", [0]*96)
+        scd_da = rec.get("s_cd_da", [0]*96)
+        cd_da = rec.get("c_d_da", [0]*96)
+        cap_da = rec.get("captive_da", [0]*96)
+        sched_da = rec.get("schedule_da", [0]*96)
+        sp_da = rec.get("setpoint_da", [0]*96)
+        sol_da = rec.get("solar_da", [0]*96)
+        sol_at = rec.get("solar_at", [0]*96)
+        band_mask = rec.get("solar_band_mask", [False]*96)
 
-        # Stage 1 arrays
-        solar_da   = rec.get("solar_da",     [0.0] * T_BLOCKS)
-        solar_at   = rec.get("solar_at",     [0.0] * T_BLOCKS)
-        rtm_q50    = rec.get("rtm_q50_used", [0.0] * T_BLOCKS)
-        x_c        = rec.get("x_c",          [0.0] * T_BLOCKS)
-        x_d        = rec.get("x_d",          [0.0] * T_BLOCKS)
-        s_c_da     = rec.get("s_c_da",       [0.0] * T_BLOCKS)
-        s_cd_da    = rec.get("s_cd_da",      [0.0] * T_BLOCKS)
-        c_d_da     = rec.get("c_d_da",       [0.0] * T_BLOCKS)
-        curtail_da = rec.get("curtail_da",   [0.0] * T_BLOCKS)
+        # Stage 2B/2A
+        sc_rt = rec.get("s_c_rt", [0]*96)
+        scd_rt = rec.get("s_cd_rt", [0]*96)
+        cd_rt = rec.get("c_d_rt", [0]*96)
+        y_c = rec.get("y_c", [0]*96)
+        y_d = rec.get("y_d", [0]*96)
+        cap_comm = rec.get("captive_committed", [0]*96)
+        sp_rt = rec.get("setpoint_rt", [0]*96)
+        sched_rt = rec.get("schedule_rt", [0]*96)
+        z_nc = rec.get("z_nc_blend", sol_da)
 
-        # Stage 1 SoC plan (mean across scenarios)
+        # Actuals
+        sc_act = rec.get("s_c_actual", [0]*96)
+        scd_act = rec.get("s_cd_actual", [0]*96)
+        cd_act = rec.get("c_d_actual", [0]*96)
+        cap_act = rec.get("captive_actual", [0]*96)
+        soc_real = rec.get("soc_realized", [0]*97)
+
+        # Prices
+        dam_p = rec.get("actual_dam_prices", [0]*96)
+        rtm_p = rec.get("actual_rtm_prices", [0]*96)
+        rtm_q = rec.get("rtm_q50_used", [0]*96)
+
+        # Pre-computed results
+        dsm_res = rec.get("dsm_results", [{}]*96)
+        iex_dam = rec.get("iex_dam_rev", [0]*96)
+        iex_rtm = rec.get("iex_rtm_rev", [0]*96)
+        iex_f = rec.get("iex_fees", [0]*96)
+        b_cap_net = rec.get("block_captive_net", [0]*96)
+        b_deg = rec.get("block_degradation", [0]*96)
+        b_net = rec.get("block_net", [0]*96)
+        nb_dsm = rec.get("no_bess_dsm", [0]*96)
+        nb_rev = rec.get("no_bess_revenue", [0]*96)
+
+        # SoC DA plan
         scenarios = rec.get("scenarios", [])
         soc_matrix = []
         for s in scenarios:
             traj = s.get("soc", [])
-            if len(traj) == T_BLOCKS + 1:
-                soc_matrix.append([v if v is not None else 0.0 for v in traj])
+            if len(traj) == 97:
+                soc_matrix.append([v or 0 for v in traj])
 
-        # Stage 2B arrays
-        s_c_rt     = rec.get("s_c_rt",       [0.0] * T_BLOCKS)
-        s_cd_rt    = rec.get("s_cd_rt",      [0.0] * T_BLOCKS)
-        c_d_rt     = rec.get("c_d_rt",       [0.0] * T_BLOCKS)
-        z_nc_blend = rec.get("z_nc_blend",   solar_da)
+        # Cumulative
+        cum = {k: 0.0 for k in [
+            "iex_net", "cap_net", "dsm_pen", "dsm_hair",
+            "deg", "net_rev", "bess_val", "nb_rev",
+            "ch_iex", "ch_sol", "ch_rtm", "dis_dam", "dis_rtm", "dis_cap"]}
 
-        # Stage 2A arrays
-        y_c        = rec.get("y_c",          [0.0] * T_BLOCKS)
-        y_d        = rec.get("y_d",          [0.0] * T_BLOCKS)
+        for t in range(96):
+            xc = float(x_c[t]); xd = float(x_d[t])
+            yc = float(y_c[t]); yd = float(y_d[t])
+            dn = xd - xc; rn = yd - yc
 
-        # Actuals arrays
-        s_c_actual     = rec.get("s_c_actual",      [0.0] * T_BLOCKS)
-        s_cd_actual    = rec.get("s_cd_actual",     [0.0] * T_BLOCKS)
-        c_d_actual     = rec.get("c_d_actual",      [0.0] * T_BLOCKS)
-        curtail_actual = rec.get("curtail_actual",  [0.0] * T_BLOCKS)
-        captive_actual = rec.get("captive_actual",  [0.0] * T_BLOCKS)
-        captive_short  = rec.get("captive_shortfall",[0.0] * T_BLOCKS)
-        captive_commit = rec.get("captive_committed",[0.0] * T_BLOCKS)
+            # DSM result for this block
+            dr = dsm_res[t] if t < len(dsm_res) else {}
 
-        # Physical SoC and prices
-        soc_realized = rec.get("soc_realized", [0.0] * (T_BLOCKS + 1))
-        dam_act = rec.get("actual_dam_prices", [0.0] * T_BLOCKS)
-        rtm_act = rec.get("actual_rtm_prices", [0.0] * T_BLOCKS)
+            iex_net_t = sg(iex_dam, t) + sg(iex_rtm, t) - sg(iex_f, t)
+            bess_dsm_sav = sg(nb_dsm, t) - (
+                dr.get("dsm_penalty", 0) + dr.get("dsm_haircut", 0))
+            bess_val_t = bess_dsm_sav + iex_net_t - sg(b_deg, t)
 
-        # Running cumulative accumulators (reset per day)
-        cum_ch_iex   = 0.0
-        cum_ch_solar = 0.0
-        cum_ch_rtm   = 0.0
-        cum_dis_dam  = 0.0
-        cum_dis_rtm  = 0.0
-        cum_dis_cap  = 0.0
-        cum_real_rev = 0.0
-        cum_cap_rev  = 0.0
-        cum_net_rev  = 0.0
-        cum_dsm_mwh  = 0.0
+            # Cumulative
+            cum["iex_net"] += iex_net_t
+            cum["cap_net"] += sg(b_cap_net, t)
+            cum["dsm_pen"] += dr.get("dsm_penalty", 0)
+            cum["dsm_hair"] += dr.get("dsm_haircut", 0)
+            cum["deg"] += sg(b_deg, t)
+            cum["net_rev"] += sg(b_net, t)
+            cum["bess_val"] += bess_val_t
+            cum["nb_rev"] += sg(nb_rev, t)
+            cum["ch_iex"] += xc * DT
+            cum["ch_sol"] += sg(sc_act, t) * DT
+            cum["ch_rtm"] += yc * DT
+            cum["dis_dam"] += xd * DT
+            cum["dis_rtm"] += yd * DT
+            cum["dis_cap"] += sg(cd_act, t) * DT
 
-        # Per-block rows
-        for t in range(T_BLOCKS):
-            xc_t   = float(x_c[t])
-            xd_t   = float(x_d[t])
-            yc_t   = float(y_c[t])
-            yd_t   = float(y_d[t])
+            tc = min(cum["ch_iex"]+cum["ch_sol"]+cum["ch_rtm"],
+                     cum["dis_dam"]+cum["dis_rtm"]+cum["dis_cap"])
+            cum_cycles = tc / USABLE_CAP if USABLE_CAP > 0 else 0
 
-            # Stage 1 plan
-            sc_da_t  = float(s_c_da[t])
-            scd_da_t = float(s_cd_da[t])
-            cd_da_t  = float(c_d_da[t])
-            cut_da_t = float(curtail_da[t])
-            sol_da_t = float(solar_da[t])
-
-            # Stage 2B revised
-            sc_rt_t  = float(s_c_rt[t])
-            scd_rt_t = float(s_cd_rt[t])
-            cd_rt_t  = float(c_d_rt[t])
-            z_nc_t   = safe_get(z_nc_blend, t, sol_da_t)
-
-            # Actuals
-            sc_at_t   = safe_get(s_c_actual, t)
-            scd_at_t  = safe_get(s_cd_actual, t)
-            cd_at_t   = safe_get(c_d_actual, t)
-            cut_at_t  = safe_get(curtail_actual, t)
-            cap_at_t  = safe_get(captive_actual, t)
-            cap_sh_t  = safe_get(captive_short, t)
-            cap_com_t = safe_get(captive_commit, t)
-            sol_at_t  = float(solar_at[t])
-
-            # Prices
-            pd_t   = float(dam_act[t])
-            pr_t   = float(rtm_act[t])
-            pq50_t = float(rtm_q50[t])
-            lag4_t = float(rtm_act[t - 4]) if t >= 4 else None
-
-            # SoC — Stage 1 plan (mean across scenarios)
-            soc_da_start_t = (float(np.mean([m[t] for m in soc_matrix]))
-                              if soc_matrix else 0.0)
-            soc_da_end_t   = (float(np.mean([m[t + 1] for m in soc_matrix]))
-                              if soc_matrix else 0.0)
-
-            # SoC — Actual physical
-            soc_at_start_t = safe_get(soc_realized, t)
-            soc_at_end_t   = safe_get(soc_realized, t + 1)
-
-            # ── Revenue formulas (all use ACTUAL prices and ACTUAL routing) ──
-            # IEX DAM: settled at actual DAM MCP
-            iex_charge  = pd_t * (-xc_t) * DT          # negative (cost)
-            iex_dam_dis = pd_t * xd_t * DT              # positive (revenue)
-            # IEX RTM: settled at actual RTM MCP
-            iex_rtm_chg = pr_t * (-yc_t) * DT           # negative (cost)
-            iex_rtm_dis = pr_t * yd_t * DT               # positive (revenue)
-            # Net IEX for this block
-            iex_net     = iex_charge + iex_dam_dis + iex_rtm_chg + iex_rtm_dis
-            # Captive PPA: settled on actual delivery
-            cap_rev_t   = ppa_rate * cap_at_t * DT       # positive (revenue)
-            # Total block revenue
-            rev_tot_t   = iex_net + cap_rev_t
-
-            # ── Stage 1 expected per-block revenue (reconstructed) ──
-            # Uses actual DAM price as proxy for scenario-average price.
-            # This is the expected contribution of block t from Stage 1 plan.
-            s1_dam_rev   = pd_t * (xd_t - xc_t) * DT
-            s1_cap_rev   = ppa_rate * (scd_da_t + cd_da_t) * DT
-            s1_iex_cost  = iex_fee * (xc_t + xd_t) * DT
-            s1_deg_cost  = deg_cost * (xd_t + cd_da_t) * DT
-            s1_dsm_cost  = dsm_proxy * (xc_t + xd_t) * DT
-            s1_block_rev = s1_dam_rev + s1_cap_rev - s1_iex_cost - s1_deg_cost - s1_dsm_cost
-
-            # Balance checks
-            da_bal = round(abs(sc_da_t + scd_da_t + cut_da_t - sol_da_t), 5)
-            at_bal = round(abs(sc_at_t + scd_at_t + cut_at_t - sol_at_t), 5)
-
-            trigger = max([b for b in sorted(RESCHEDULE_BLOCKS) if b <= t],
-                          default=None)
-
-            # ── Cumulative accumulators ──
-            cum_ch_iex   += xc_t * DT
-            cum_ch_solar += sc_at_t * DT
-            cum_ch_rtm   += yc_t * DT
-            cum_dis_dam  += xd_t * DT
-            cum_dis_rtm  += yd_t * DT
-            cum_dis_cap  += cd_at_t * DT
-            cum_real_rev += rev_tot_t
-            cum_cap_rev  += cap_rev_t
-            cum_net_rev  += rev_tot_t  # gross; net requires cost subtraction
-            cum_dsm_mwh  += safe_get(rec.get("block_dsm_energy"), t, 0.0) if rec.get("block_dsm_energy") else 0.0
-
-            # Cumulative BESS cycles
-            total_ch_cum  = cum_ch_iex + cum_ch_solar + cum_ch_rtm
-            total_dis_cum = cum_dis_dam + cum_dis_rtm + cum_dis_cap
-            cum_cycles    = min(total_ch_cum, total_dis_cum) / USABLE_CAPACITY if USABLE_CAPACITY > 0 else 0
+            soc_da_s = float(np.mean([m[t] for m in soc_matrix])) if soc_matrix else 0
+            soc_da_e = float(np.mean([m[t+1] for m in soc_matrix])) if soc_matrix else 0
+            lag4 = float(rtm_p[t-4]) if t >= 4 else None
+            trigger = max([b for b in sorted(RESCHEDULE_BLOCKS) if b <= t], default=None)
 
             rows.append({
-                # ── Identifiers ───────────────────────────────────────────
-                "date":                       date,
-                "block":                      t,
-                "block_time_ist":             block_time(t),
-                "is_reschedule_block":        int(t in RESCHEDULE_BLOCKS),
-                "stage2b_trigger_block":      trigger,
-
-                # ── Parameters ────────────────────────────────────────────
-                "p_max_mw":                   bess_p_max,
-                "solar_inverter_mw":          sol_inv_mw,
-                "r_ppa_rs_mwh":               ppa_rate,
-
-                # ── Solar profiles ────────────────────────────────────────
-                "z_sol_da_mw":                round(sol_da_t, 4),
-                "z_sol_nc_mw":                round(z_nc_t, 4),
-                "z_sol_at_mw":                round(sol_at_t, 4),
-                "sol_da_vs_at_delta_mw":      round(sol_da_t - sol_at_t, 4),
-
-                # ── Actual prices ─────────────────────────────────────────
-                "actual_dam_price_rs_mwh":    round(pd_t, 2),
-                "actual_rtm_price_rs_mwh":    round(pr_t, 2),
-                "p_rtm_q50_rs_mwh":           round(pq50_t, 2),
-                "p_rtm_lag4_rs_mwh":          round(lag4_t, 2) if lag4_t is not None else "",
-
-                # ── Stage 1 DA plan ───────────────────────────────────────
-                "x_c_da_mw":                  round(xc_t, 4),
-                "x_d_da_mw":                  round(xd_t, 4),
-                "dam_net_mw":                 round(xd_t - xc_t, 4),
-                "s_c_da_mw":                  round(sc_da_t, 4),
-                "s_cd_da_mw":                 round(scd_da_t, 4),
-                "c_d_da_mw":                  round(cd_da_t, 4),
-                "curtail_da_mw":              round(cut_da_t, 4),
-                "captive_da_mw":              round(scd_da_t + cd_da_t, 4),
-                "solar_da_balance_ok":        da_bal,
-                "stage1_exp_block_rev_rs":    round(s1_block_rev, 2),
-
-                # ── Stage 2B revised plan ─────────────────────────────────
-                "s_c_rt_mw":                  round(sc_rt_t, 4),
-                "s_cd_rt_mw":                 round(scd_rt_t, 4),
-                "c_d_rt_mw":                  round(cd_rt_t, 4),
-                "captive_rt_mw":              round(scd_rt_t + cd_rt_t, 4),
-                "captive_committed_mw":       round(cap_com_t, 4),
-
-                # ── Stage 2A RTM bids ─────────────────────────────────────
-                "y_c_mw":                     round(yc_t, 4),
-                "y_d_mw":                     round(yd_t, 4),
-                "y_net_mw":                   round(yd_t - yc_t, 4),
-
-                # ── Actuals (metered solar routing) ───────────────────────
-                "s_c_actual_mw":              round(sc_at_t, 4),
-                "s_cd_actual_mw":             round(scd_at_t, 4),
-                "c_d_actual_mw":              round(cd_at_t, 4),
-                "curtail_actual_mw":          round(cut_at_t, 4),
-                "captive_actual_mw":          round(cap_at_t, 4),
-                "captive_shortfall_mw":       round(cap_sh_t, 4),
-                "solar_actual_balance_ok":    at_bal,
-
-                # ── Plan vs Actual deltas ─────────────────────────────────
-                "s_c_plan_vs_actual_mw":      round(sc_rt_t - sc_at_t, 4),
-                "s_cd_plan_vs_actual_mw":     round(scd_rt_t - scd_at_t, 4),
-                "c_d_plan_vs_actual_mw":      round(cd_rt_t - cd_at_t, 4),
-                "captive_plan_vs_actual_mw":  round(cap_com_t - cap_at_t, 4),
-
-                # ── SoC ───────────────────────────────────────────────────
-                "soc_da_start_mwh":           round(soc_da_start_t, 4),
-                "soc_da_end_mwh":             round(soc_da_end_t, 4),
-                "soc_actual_start_mwh":       round(soc_at_start_t, 4),
-                "soc_actual_end_mwh":         round(soc_at_end_t, 4),
-                "soc_da_vs_actual_gap_mwh":   round(soc_da_end_t - soc_at_end_t, 4),
-
-                # ── Settlement revenue ────────────────────────────────────
-                "iex_charge_cost_rs":         round(iex_charge, 2),
-                "iex_dam_discharge_rs":       round(iex_dam_dis, 2),
-                "iex_rtm_charge_cost_rs":     round(iex_rtm_chg, 2),
-                "iex_rtm_discharge_rs":       round(iex_rtm_dis, 2),
-                "iex_net_block_rs":           round(iex_net, 2),
-                "captive_revenue_rs":         round(cap_rev_t, 2),
-                "total_block_revenue_rs":     round(rev_tot_t, 2),
-
-                # ── Cumulative totals (running sum, block 0 to t) ─────────
-                "cum_bess_cycles":            round(cum_cycles, 4),
-                "cum_charge_iex_mwh":         round(cum_ch_iex, 4),
-                "cum_charge_solar_mwh":       round(cum_ch_solar, 4),
-                "cum_charge_rtm_mwh":         round(cum_ch_rtm, 4),
-                "cum_discharge_dam_mwh":      round(cum_dis_dam, 4),
-                "cum_discharge_rtm_mwh":      round(cum_dis_rtm, 4),
-                "cum_discharge_captive_mwh":  round(cum_dis_cap, 4),
-                "cum_realized_revenue_rs":    round(cum_real_rev, 2),
-                "cum_captive_revenue_rs":     round(cum_cap_rev, 2),
-                "cum_net_revenue_rs":         round(cum_net_rev, 2),
-                "cum_dsm_mwh":                round(cum_dsm_mwh, 6),
+                # Identifiers
+                "date": date, "block": t, "block_time_ist": block_time(t),
+                "is_reschedule_block": int(t in RESCHEDULE_BLOCKS),
+                "stage2b_trigger_block": trigger,
+                # Parameters
+                "p_max_mw": p_max, "solar_inverter_mw": s_inv,
+                "r_ppa_rs_mwh": ppa, "avail_cap_mwh": avail_cap,
+                # Solar
+                "z_sol_da_mw": round(sg(sol_da, t), 4),
+                "z_sol_nc_mw": round(sg(z_nc, t), 4),
+                "z_sol_at_mw": round(sg(sol_at, t), 4),
+                "sol_forecast_error_mw": round(sg(sol_da, t) - sg(sol_at, t), 4),
+                # Prices
+                "actual_dam_price_rs_mwh": round(sg(dam_p, t), 2),
+                "actual_rtm_price_rs_mwh": round(sg(rtm_p, t), 2),
+                "p_rtm_q50_rs_mwh": round(sg(rtm_q, t), 2),
+                "p_rtm_lag4_rs_mwh": round(lag4, 2) if lag4 is not None else "",
+                # Stage 1
+                "x_c_da_mw": round(xc, 4), "x_d_da_mw": round(xd, 4),
+                "dam_net_mw": round(dn, 4),
+                "s_c_da_mw": round(sg(sc_da, t), 4),
+                "s_cd_da_mw": round(sg(scd_da, t), 4),
+                "c_d_da_mw": round(sg(cd_da, t), 4),
+                "captive_da_mw": round(sg(cap_da, t), 4),
+                "schedule_da_mw": round(sg(sched_da, t), 4),
+                "setpoint_da_mw": round(sg(sp_da, t), 4),
+                "soc_da_start_mwh": round(soc_da_s, 4),
+                "soc_da_end_mwh": round(soc_da_e, 4),
+                # Stage 2B
+                "s_c_rt_mw": round(sg(sc_rt, t), 4),
+                "s_cd_rt_mw": round(sg(scd_rt, t), 4),
+                "c_d_rt_mw": round(sg(cd_rt, t), 4),
+                "captive_rt_mw": round(sg(scd_rt, t) + sg(cd_rt, t), 4),
+                "schedule_rt_mw": round(sg(sched_rt, t), 4),
+                "setpoint_rt_mw": round(sg(sp_rt, t), 4),
+                "captive_committed_mw": round(sg(cap_comm, t), 4),
+                # Stage 2A
+                "y_c_mw": round(yc, 4), "y_d_mw": round(yd, 4),
+                "y_net_mw": round(rn, 4),
+                # Actuals
+                "active_setpoint_mw": round(sg(sp_rt, t), 4),
+                "s_c_actual_mw": round(sg(sc_act, t), 4),
+                "s_cd_actual_mw": round(sg(scd_act, t), 4),
+                "c_d_actual_mw": round(sg(cd_act, t), 4),
+                "captive_actual_mw": round(sg(cap_act, t), 4),
+                "dispatch_case": ("over" if sg(sol_at,t) > sg(sp_rt,t)+0.001
+                                  else "under" if sg(sol_at,t) < sg(sp_rt,t)-0.001
+                                  else "exact"),
+                # SoC
+                "soc_actual_start_mwh": round(sg(soc_real, t), 4),
+                "soc_actual_end_mwh": round(sg(soc_real, t+1), 4),
+                "is_solar_band": int(sg(band_mask, t, False)),
+                # DSM
+                "contract_rate_rs_mwh": round(dr.get("charge_rate", ppa) / max(dr.get("charge_rate_mult", 1), 0.01), 2) if dr.get("charge_rate_mult", 1) > 0 else round(ppa, 2),
+                "actual_total_mw": round(sg(cap_act, t), 4),
+                "scheduled_total_mw": round(sg(sched_rt, t), 4),
+                "deviation_mwh": round(dr.get("dws_mwh", 0), 6),
+                "deviation_pct": round(dr.get("dws_pct", 0), 2),
+                "deviation_band": dr.get("band", ""),
+                "deviation_direction": dr.get("direction", ""),
+                "charge_rate_rs_mwh": round(dr.get("charge_rate", 0), 2),
+                "charge_rate_multiplier": round(dr.get("charge_rate_mult", 0), 2),
+                # Under
+                "under_revenue_received_rs": round(dr.get("under_revenue_received", 0), 2),
+                "under_dsm_penalty_rs": round(dr.get("under_dsm_penalty", 0), 2),
+                "under_net_cash_flow_rs": round(dr.get("under_net_cash", 0), 2),
+                "under_if_fully_scheduled_rs": round(dr.get("under_if_fully_sched", 0), 2),
+                "under_financial_damage_rs": round(dr.get("under_damage", 0), 2),
+                # Over
+                "over_revenue_sched_qty_rs": round(dr.get("over_revenue_sched", 0), 2),
+                "over_revenue_dev_qty_rs": round(dr.get("over_revenue_dev", 0), 2),
+                "over_total_received_rs": round(dr.get("over_total_received", 0), 2),
+                "over_if_all_at_cr_rs": round(dr.get("over_if_all_cr", 0), 2),
+                "over_revenue_haircut_rs": round(dr.get("over_haircut", 0), 2),
+                # IEX
+                "iex_dam_revenue_rs": round(sg(iex_dam, t), 2),
+                "iex_rtm_revenue_rs": round(sg(iex_rtm, t), 2),
+                "iex_fees_rs": round(sg(iex_f, t), 2),
+                "iex_net_rs": round(iex_net_t, 2),
+                # Block P&L
+                "block_captive_net_rs": round(sg(b_cap_net, t), 2),
+                "block_iex_net_rs": round(iex_net_t, 2),
+                "block_degradation_rs": round(sg(b_deg, t), 2),
+                "block_net_rs": round(sg(b_net, t), 2),
+                # BESS ROI
+                "no_bess_deviation_pct": round(abs(sg(sol_at,t)-sg(cap_comm,t))*DT/avail_cap*100, 2) if avail_cap > 0 else 0,
+                "no_bess_dsm_total_rs": round(sg(nb_dsm, t), 2),
+                "no_bess_revenue_rs": round(sg(nb_rev, t), 2),
+                "bess_dsm_savings_rs": round(bess_dsm_sav, 2),
+                "bess_iex_net_rs": round(iex_net_t, 2),
+                "bess_total_value_rs": round(bess_val_t, 2),
+                # Cumulative
+                "cum_bess_cycles": round(cum_cycles, 4),
+                "cum_iex_net_rs": round(cum["iex_net"], 2),
+                "cum_captive_net_rs": round(cum["cap_net"], 2),
+                "cum_dsm_penalty_rs": round(cum["dsm_pen"], 2),
+                "cum_dsm_haircut_rs": round(cum["dsm_hair"], 2),
+                "cum_degradation_rs": round(cum["deg"], 2),
+                "cum_net_revenue_rs": round(cum["net_rev"], 2),
+                "cum_bess_value_rs": round(cum["bess_val"], 2),
+                "cum_no_bess_revenue_rs": round(cum["nb_rev"], 2),
             })
-
     return pd.DataFrame(rows)
 
 
-def export_all(results_dir_str: str) -> None:
-    results_dir = Path(results_dir_str)
-    records = load_jsons(results_dir)
+def export_all(results_dir_str):
+    rdir = Path(results_dir_str)
+    records = load_jsons(rdir)
 
-    # Read parameters from config
-    ppa_rate = 3500.0
-    iex_fee  = 200.0
-    deg_cost = 650.0
-    bess_yaml = Path("config/bess.yaml")
-    if bess_yaml.exists():
+    ppa, iex_fee, deg = 3500.0, 200.0, 650.0
+    by = Path("config/bess.yaml")
+    if by.exists():
         import yaml
-        with open(bess_yaml, encoding="ascii") as f:
+        with open(by, encoding="utf-8") as f:
             b = yaml.safe_load(f)
-        ppa_rate = b.get("ppa_rate_rs_mwh", 3500.0)
-        iex_fee  = b.get("iex_fee_rs_mwh", 200.0)
-        deg_cost = b.get("degradation_cost_rs_mwh", 650.0)
+        ppa = b.get("ppa_rate_rs_mwh", 3500.0)
+        iex_fee = b.get("iex_fee_rs_mwh", 200.0)
+        deg = b.get("degradation_cost_rs_mwh", 650.0)
 
-    print(f"Building export for {len(records)} days...")
-    print(f"  PPA={ppa_rate} Rs/MWh, IEX fee={iex_fee} Rs/MWh, "
-          f"Deg={deg_cost} Rs/MWh")
-    df = build_full_csv(records, ppa_rate, iex_fee, deg_cost)
+    df = build_csv(records, ppa, iex_fee, deg)
+    out = rdir / "backtest_full_export_v9.csv"
+    df.to_csv(out, index=False)
+    print(f"Saved: {out} ({len(df):,} rows x {len(df.columns)} cols)")
 
-    out_path = results_dir / "backtest_full_export_v3.csv"
-    df.to_csv(out_path, index=False)
-    print(f"Saved: {out_path}  ({len(df):,} rows x {len(df.columns)} columns)")
-
-    # Daily summary (computed from cumulative values at block 95)
-    print()
-    print("=" * 110)
-    print("DAILY SUMMARY (from block 95 cumulative values)")
-    print("=" * 110)
-    print(f"{'Date':<12} {'Cycles':>7} {'ChIEX':>7} {'ChSol':>7} {'ChRTM':>7} "
-          f"{'DiDAM':>7} {'DiRTM':>7} {'DiCap':>7} "
-          f"{'Revenue':>11} {'Captive':>11} {'CapShort':>8}")
-
-    for date, grp in df.groupby("date"):
-        last = grp.iloc[-1]  # block 95 — has full-day cumulative
-        cap_short_total = grp["captive_shortfall_mw"].sum() * DT
-        print(f"{date:<12} "
-              f"{last['cum_bess_cycles']:>7.3f} "
-              f"{last['cum_charge_iex_mwh']:>7.3f} "
-              f"{last['cum_charge_solar_mwh']:>7.3f} "
-              f"{last['cum_charge_rtm_mwh']:>7.3f} "
-              f"{last['cum_discharge_dam_mwh']:>7.3f} "
-              f"{last['cum_discharge_rtm_mwh']:>7.3f} "
-              f"{last['cum_discharge_captive_mwh']:>7.3f} "
-              f"Rs{last['cum_realized_revenue_rs']:>9,.0f} "
-              f"Rs{last['cum_captive_revenue_rs']:>9,.0f} "
-              f"{cap_short_total:>7.3f}")
-
-    # Grand totals
-    total_days = df["date"].nunique()
-    eod_rows = df.groupby("date").last()
-    total_rev   = eod_rows["cum_realized_revenue_rs"].sum()
-    total_cap   = eod_rows["cum_captive_revenue_rs"].sum()
-    total_short = df["captive_shortfall_mw"].sum() * DT
-    total_cycles = eod_rows["cum_bess_cycles"].sum()
-    print(f"\nTotal: {total_days} days | "
-          f"Revenue: Rs {total_rev:,.0f} | "
-          f"Captive: Rs {total_cap:,.0f} | "
-          f"Cycles: {total_cycles:.2f} | "
-          f"Captive Shortfall: {total_short:.3f} MWh")
+    # Daily summary from last block cumulative
+    print(f"\n{'Date':<12} {'Net_Rev':>11} {'Cap_Net':>11} {'IEX_Net':>11} "
+          f"{'DSM_Pen':>9} {'BESS_Val':>11} {'Cycles':>7}")
+    for d, g in df.groupby("date"):
+        r = g.iloc[-1]
+        print(f"{d:<12} Rs{r['cum_net_revenue_rs']:>9,.0f} "
+              f"Rs{r['cum_captive_net_rs']:>9,.0f} "
+              f"Rs{r['cum_iex_net_rs']:>9,.0f} "
+              f"Rs{r['cum_dsm_penalty_rs']:>7,.0f} "
+              f"Rs{r['cum_bess_value_rs']:>9,.0f} "
+              f"{r['cum_bess_cycles']:>7.3f}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--results", default="results/phase3b_solar")
-    args = parser.parse_args()
-    export_all(args.results)
+    export_all(parser.parse_args().results)
