@@ -1,0 +1,43 @@
+# config/bess_rtc.yaml — Architecture v10 RTC (Solar+BESS with Round-the-Clock Captive)
+# Solar (25.4 MWp DC / 16.4 MW Inverter) + BESS (80 MWh / 16.4 MW PCS)
+# RTC Captive Contract: 5 MW Constant Delivery
+
+# ── BESS Physical Parameters ───────────────────────────────────────────────────
+p_max_mw: 16.4                  # MW — PCS charge or discharge rating
+e_max_mwh: 80.0                 # MWh — BESS usable capacity (100% SoC)
+e_min_mwh: 8.0                  # MWh — BESS floor (10% DoD floor)
+soc_initial_mwh: 40.0           # MWh — SOD terminal SoC (SOD = EOD = 40 MWh)
+soc_terminal_min_mwh: 40.0      # MWh — EOD hard equality constraint
+eta_charge: 0.9487              # fraction — one-way charge efficiency
+eta_discharge: 0.9487           # fraction — one-way discharge efficiency
+
+# ── Solar Plant ────────────────────────────────────────────────────────────────
+solar_capacity_mwp: 25.4        # MWp — DC array nameplate
+solar_inverter_mw: 16.4         # MW  — AC inverter output cap
+
+# ── Financial Parameters ───────────────────────────────────────────────────────
+ppa_rate_rs_mwh: 3500.0         # Rs/MWh — RTC PPA contract rate (CR base)
+iex_fee_rs_mwh: 200.0           # Rs/MWh — IEX transaction charge per side
+degradation_cost_rs_mwh: 650.0  # Rs/MWh — post-hoc degradation (NOT in LP)
+
+# ── RTC Captive Contract ───────────────────────────────────────────────────────
+rtc_mw: 5.0                     # MW — contracted RTC delivery level (max)
+rtc_min_mw: 4.0                 # MW — minimum acceptable delivery (80% of RTC_MW)
+rtc_tol_pct: 0.05               # fraction — ±5% free RT fluctuation band
+rtc_advance_blocks: 16          # blocks = 4 hours — advance notice for >5% revision
+
+# ── Optimizer Settings ─────────────────────────────────────────────────────────
+max_cycles_per_day: 1           # max daily cycle budget (1 full cycle = e_max - e_min)
+soc_terminal_mode: hard         # hard equality: soc[96] == SOC_TARGET
+soc_terminal_value_rs_mwh: 0.0
+
+# ── Stage 2 Timing ─────────────────────────────────────────────────────────────
+rtm_lead_blocks: 3              # RTM bid lead time (blocks ahead)
+captive_buffer_blocks: 12       # 3-hour schedule freeze window for consumer
+captive_buffer_tolerance_mw: 0.5  # ±0.5 MW max block-to-block captive jump in buffer
+
+# ── Solar SoC Band ─────────────────────────────────────────────────────────────
+soc_solar_low_pct: 0.20         # 20% of e_max = 16.0 MWh
+soc_solar_high_pct: 0.80        # 80% of e_max = 64.0 MWh
+solar_threshold_mw: 0.5         # MW — minimum solar to be "generating"
+solar_buffer_blocks: 2          # transition buffer before/after solar hours
